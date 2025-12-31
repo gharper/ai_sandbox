@@ -10,6 +10,13 @@ Build and run the container with the current repo mounted at `/workspace`. The d
 python -m ai_sandbox
 ```
 
+Choose an agent:
+
+```bash
+ai_sandbox --agent codex
+ai_sandbox --agent copilot
+```
+
 Install as a CLI tool inside a virtual environment:
 
 ```bash
@@ -55,6 +62,8 @@ The runner adds `host.docker.internal` mapped to the host gateway by default.
 
 Need published ports? Use `--docker-arg -p --docker-arg HOST:CONTAINER` to map them explicitly.
 
+If `GITHUB_AI_PAT_TOKEN` is set in your local environment, it is passed into the container as `GITHUB_TOKEN` unless you explicitly set `GITHUB_TOKEN=...` via `--docker-arg`.
+
 ## Development
 
 Set up a virtual environment and install the CLI:
@@ -69,4 +78,12 @@ Run tests:
 
 ```bash
 python -m unittest discover -s tests
+```
+
+## Copilot
+
+The Docker image installs GitHub Copilot with:
+
+```bash
+npm install -g @github/copilot
 ```

@@ -31,7 +31,7 @@ RUN set -eux; \
     node --version; \
     npm --version
 
-RUN npm install -g @openai/codex codex-sdk
+RUN npm install -g @openai/codex codex-sdk @github/copilot
 
 RUN mkdir -p /root/.codex
 
