@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
+import textwrap
 from typing import Iterable, List, Sequence
 
 DEFAULT_AUTH_FILES = (
@@ -14,11 +16,91 @@ DEFAULT_AUTH_FILES = (
     "~/.codex/auth.json",
 )
 
+REDACT_KEYS = {"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_AI_PAT_TOKEN", "PASSWORD", "SECRET"}
+
+
+def _configure_logging() -> None:
+    level_name = os.getenv("AI_SANDBOX_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    fmt = os.getenv(
+        "AI_SANDBOX_LOG_FMT",
+        "%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logging.basicConfig(level=level, format=fmt)
+
+
+def _redact_item(item: str) -> str:
+    for key in REDACT_KEYS:
+        if item.startswith(f"{key}=") or ("=" in item and item.split("=", 1)[0] == key):
+            return f"{key}=REDACTED"
+        # also redact inline occurrences like "--env GITHUB_TOKEN=..."
+        if f"{key}=" in item:
+            left, _ = item.split(f"{key}=", 1)
+            return f"{left}{key}=REDACTED"
+    return item
+
+
+def _redact_cmd(cmd: Sequence[str]) -> str:
+    return " ".join(_redact_item(str(c)) for c in cmd)
+
+
+def run_subprocess(
+    cmd: Sequence[str],
+    *,
+    check: bool = True,
+    timeout: int | None = 120,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    logger = logging.getLogger("ai_sandbox.subproc")
+    logger.debug("Running command: %s", _redact_cmd(cmd))
+    try:
+        if capture:
+            completed = subprocess.run(
+                list(cmd),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if completed.returncode != 0 and check:
+                # Trim long outputs for logs
+                stdout = (completed.stdout or "").strip()
+                stderr = (completed.stderr or "").strip()
+                logger.error(
+                    "Command failed (rc=%s). stdout=%s stderr=%s",
+                    completed.returncode,
+                    (stdout[:1000] + "...") if len(stdout) > 1000 else stdout,
+                    (stderr[:1000] + "...") if len(stderr) > 1000 else stderr,
+                )
+                raise subprocess.CalledProcessError(
+                    completed.returncode,
+                    cmd,
+                    output=completed.stdout,
+                    stderr=completed.stderr,
+                )
+            logger.debug(
+                "Command finished (rc=%s). stdout=%s",
+                completed.returncode,
+                (completed.stdout or "")[:500],
+            )
+            return completed
+        else:
+            # stream output directly (useful for interactive TTY runs)
+            completed = subprocess.run(list(cmd), check=False)
+            if completed.returncode != 0 and check:
+                logger.error("Command failed with rc=%s", completed.returncode)
+                raise subprocess.CalledProcessError(completed.returncode, cmd)
+            return completed
+    except subprocess.TimeoutExpired as e:
+        logger.exception("Command timed out: %s", _redact_cmd(cmd))
+        raise
+
 
 def build_image(image: str, dockerfile: str, context: str) -> None:
-    cmd = ["docker", "build", "-t", image, "-f", dockerfile]
-    cmd.append(context)
-    subprocess.run(cmd, check=True)
+    logger = logging.getLogger("ai_sandbox")
+    cmd = ["docker", "build", "-t", image, "-f", dockerfile, context]
+    logger.info("Building Docker image %s using %s", image, dockerfile)
+    run_subprocess(cmd, timeout=900)
 
 
 def build_run_command(
@@ -47,10 +129,36 @@ def build_run_command(
         cmd.append("-it")
     if name:
         cmd.extend(["--name", name])
-    cmd.extend(extra_args)
+    cmd.extend(list(extra_args))
     cmd.append(image)
-    cmd.extend(container_cmd)
+    cmd.extend(list(container_cmd))
     return cmd
+
+
+def has_env_arg(extra_args: Sequence[str], key: str) -> bool:
+    key_prefix = f"{key}="
+    idx = 0
+    while idx < len(extra_args):
+        item = extra_args[idx]
+        if item in ("-e", "--env"):
+            if idx + 1 < len(extra_args) and extra_args[idx + 1].startswith(key_prefix):
+                return True
+            idx += 2
+            continue
+        if item.startswith(key_prefix):
+            return True
+        if item.startswith("--env="):
+            candidate = item[len("--env=") :]
+            if candidate.startswith(key_prefix):
+                return True
+        if item.startswith("-e") and item != "-e":
+            candidate = item[len("-e") :]
+            if candidate.startswith("="):
+                candidate = candidate[1:]
+            if candidate.startswith(key_prefix):
+                return True
+        idx += 1
+    return False
 
 
 def run_container(
@@ -62,6 +170,7 @@ def run_container(
     auth_file: str | None,
     use_tty: bool,
 ) -> None:
+    logger = logging.getLogger("ai_sandbox")
     cmd = build_run_command(
         image,
         context,
@@ -71,7 +180,15 @@ def run_container(
         auth_file,
         use_tty,
     )
-    subprocess.run(cmd, check=True)
+    logger.info("Running container with image %s", image)
+    # If interactive TTY, stream output directly so user can interact.
+    try:
+        run_subprocess(cmd, check=True, capture=not use_tty, timeout=None)
+    except subprocess.CalledProcessError:
+        logger.exception(
+            "Docker run failed; consider re-running without -it to capture logs"
+        )
+        raise
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -120,6 +237,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Disable auth mounting (overrides --auth-file)",
     )
     parser.add_argument(
+        "--agent",
+        choices=["codex", "copilot"],
+        default="codex",
+        help="AI agent to run inside the container (default: codex)",
+    )
+    parser.add_argument(
         "cmd",
         nargs=argparse.REMAINDER,
         help="Command to run in the container (default: /bin/bash)",
@@ -149,43 +272,93 @@ def resolve_auth_file(
     return None
 
 
+def _check_docker_available() -> None:
+    logger = logging.getLogger("ai_sandbox")
+    try:
+        run_subprocess(["docker", "info"], timeout=10)
+    except Exception:
+        logger.exception(
+            "Docker does not appear to be available. Ensure the Docker daemon is running and you have access to it."
+        )
+        raise
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    cmd_args = list(args.cmd)
-    if cmd_args[:1] == ["--"]:
-        cmd_args = cmd_args[1:]
-    container_cmd = cmd_args or ["codex", "--full-auto"]
-    use_tty = not args.no_tty
-    context = os.path.abspath(os.path.expanduser(args.context))
-    auth_candidates = [args.auth_file] if args.auth_file else list(DEFAULT_AUTH_FILES)
-    if args.no_auth or (args.auth_file and args.auth_file.lower() == "none"):
-        auth_file = None
-    else:
-        resolved_auth_candidates = resolve_auth_candidates(context, auth_candidates)
-        auth_file = resolve_auth_file(context, auth_candidates)
-        if not auth_file:
-            print(
-                "Warning: auth file not found at "
-                f"{', '.join(resolved_auth_candidates)}. "
-                "Continuing without mounting credentials.",
-                file=sys.stderr,
-            )
-    if os.path.isabs(args.dockerfile):
-        dockerfile = args.dockerfile
-    else:
-        dockerfile = os.path.join(context, args.dockerfile)
-    if not args.no_build:
-        build_image(args.image, dockerfile, context)
-    run_container(
-        args.image,
-        context,
-        args.name,
-        args.docker_arg,
-        container_cmd,
-        auth_file,
-        use_tty,
-    )
-    return 0
+    _configure_logging()
+    logger = logging.getLogger("ai_sandbox")
+    try:
+        args = parse_args(argv)
+        cmd_args = list(args.cmd)
+        if cmd_args[:1] == ["--"]:
+            cmd_args = cmd_args[1:]
+        if cmd_args:
+            container_cmd = cmd_args
+        elif args.agent == "copilot":
+            container_cmd = ["copilot", "--add-dir", "/workspace", "--allow-all-tools"]
+        else:
+            container_cmd = ["codex", "--full-auto"]
+        use_tty = not args.no_tty
+        context = os.path.abspath(os.path.expanduser(args.context))
+        extra_args = list(args.docker_arg)
+        if args.agent == "copilot":
+            gh_token = os.getenv("GH_TOKEN")
+            if gh_token and not has_env_arg(extra_args, "GH_TOKEN"):
+                extra_args.extend(["-e", f"GH_TOKEN={gh_token}"])
+            github_token = os.getenv("GITHUB_TOKEN")
+            if github_token and not has_env_arg(extra_args, "GITHUB_TOKEN"):
+                extra_args.extend(["-e", f"GITHUB_TOKEN={github_token}"])
+        github_token = os.getenv("GITHUB_AI_PAT_TOKEN")
+        if (
+            github_token
+            and args.agent != "copilot"
+            and not has_env_arg(extra_args, "GITHUB_TOKEN")
+        ):
+            extra_args.extend(["-e", f"GITHUB_TOKEN={github_token}"])
+        auth_candidates = (
+            [args.auth_file] if args.auth_file else list(DEFAULT_AUTH_FILES)
+        )
+        if args.no_auth or (args.auth_file and args.auth_file.lower() == "none"):
+            auth_file = None
+        else:
+            resolved_auth_candidates = resolve_auth_candidates(context, auth_candidates)
+            auth_file = resolve_auth_file(context, auth_candidates)
+            if not auth_file:
+                logger.warning(
+                    "Auth file not found at %s. Continuing without mounting credentials.",
+                    ", ".join(resolved_auth_candidates),
+                )
+        if os.path.isabs(args.dockerfile):
+            dockerfile = args.dockerfile
+        else:
+            dockerfile = os.path.join(context, args.dockerfile)
+
+        # validate Docker early and give a helpful error
+        _check_docker_available()
+
+        if not args.no_build:
+            build_image(args.image, dockerfile, context)
+        run_container(
+            args.image,
+            context,
+            args.name,
+            extra_args,
+            container_cmd,
+            auth_file,
+            use_tty,
+        )
+        return 0
+    except KeyboardInterrupt:
+        logger = logging.getLogger("ai_sandbox")
+        logger.info("Interrupted by user. Exiting.")
+        return 130
+    except subprocess.CalledProcessError as e:
+        logger = logging.getLogger("ai_sandbox")
+        logger.error("External command failed: %s", e)
+        return 2
+    except Exception:
+        logger = logging.getLogger("ai_sandbox")
+        logger.exception("Unhandled error")
+        return 1
 
 
 if __name__ == "__main__":

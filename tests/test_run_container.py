@@ -1,3 +1,4 @@
+import logging
 import os
 import unittest
 from unittest import mock
@@ -6,12 +7,12 @@ from ai_sandbox import cli
 
 
 class TestRunContainer(unittest.TestCase):
-    @mock.patch("ai_sandbox.cli.subprocess.run")
+    @mock.patch("ai_sandbox.cli.run_subprocess")
     def test_build_image_defaults(self, run_mock):
         cli.build_image("img", "Dockerfile", "/ctx")
         run_mock.assert_called_once_with(
             ["docker", "build", "-t", "img", "-f", "Dockerfile", "/ctx"],
-            check=True,
+            timeout=900,
         )
 
     def test_build_run_command_defaults(self):
@@ -85,7 +86,16 @@ class TestRunContainer(unittest.TestCase):
         )
         self.assertNotIn("/root/.codex/auth.json", " ".join(cmd))
 
-    @mock.patch("ai_sandbox.cli.subprocess.run")
+    def test_has_env_arg_variants(self):
+        self.assertTrue(cli.has_env_arg(["-e", "GITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertTrue(cli.has_env_arg(["--env", "GITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertTrue(cli.has_env_arg(["--env=GITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertTrue(cli.has_env_arg(["-eGITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertTrue(cli.has_env_arg(["-e=GITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertTrue(cli.has_env_arg(["GITHUB_TOKEN=foo"], "GITHUB_TOKEN"))
+        self.assertFalse(cli.has_env_arg(["-e", "OTHER=foo"], "GITHUB_TOKEN"))
+
+    @mock.patch("ai_sandbox.cli.run_subprocess")
     def test_run_container_invokes_docker(self, run_mock):
         cli.run_container(
             "img",
@@ -115,33 +125,44 @@ class TestRunContainer(unittest.TestCase):
                 "--full-auto",
             ],
             check=True,
+            capture=False,
+            timeout=None,
         )
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.subprocess.run")
-    def test_main_strips_double_dash(self, run_mock):
-        cli.main(
-            [
-                "--no-build",
-                "--no-tty",
-                "--auth-file",
-                "~/.codex/device_auth.json",
-                "--",
-                "/bin/bash",
-            ]
-        )
+    def test_main_strips_double_dash(self, run_mock, _docker_mock):
+        run_mock.return_value.returncode = 0
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                [
+                    "--no-build",
+                    "--no-tty",
+                    "--auth-file",
+                    "~/.codex/device_auth.json",
+                    "--",
+                    "/bin/bash",
+                ]
+            )
         run_mock.assert_called_once()
         cmd = run_mock.call_args[0][0]
         self.assertNotIn("--", cmd)
         self.assertIn("/bin/bash", cmd)
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
     @mock.patch("ai_sandbox.cli.build_image")
-    def test_main_resolves_context_and_dockerfile(self, build_mock, run_mock):
+    def test_main_resolves_context_and_dockerfile(
+        self, build_mock, run_mock, _docker_mock
+    ):
         rel_context = os.path.relpath("some/context", os.getcwd())
         expected_context = os.path.abspath(os.path.expanduser(rel_context))
         expected_dockerfile = os.path.join(expected_context, "Dockerfile")
 
-        cli.main(["--context", rel_context, "--auth-file", "~/.codex/device_auth.json"])
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                ["--context", rel_context, "--auth-file", "~/.codex/device_auth.json"]
+            )
 
         build_mock.assert_called_once_with(
             "ai-sandbox-codex",
@@ -151,100 +172,111 @@ class TestRunContainer(unittest.TestCase):
         run_mock.assert_called_once()
         self.assertEqual(run_mock.call_args.args[1], expected_context)
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
-    def test_main_missing_auth_file_warns_and_continues(self, run_mock):
-        with mock.patch("ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock):
-            cli.main(
-                [
-                    "--no-build",
-                    "--context",
-                    ".",
-                    "--auth-file",
-                    "/nonexistent/device_auth.json",
-                ]
-            )
+    def test_main_missing_auth_file_warns_and_continues(self, run_mock, _docker_mock):
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING"):
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        ".",
+                        "--auth-file",
+                        "/nonexistent/device_auth.json",
+                    ]
+                )
         self.assertIsNone(run_mock.call_args.args[5])
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
-    def test_main_no_auth_skips_warning(self, run_mock):
-        with mock.patch(
-            "ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock
-        ) as stderr_mock:
-            cli.main(
-                [
-                    "--no-build",
-                    "--context",
-                    ".",
-                    "--no-auth",
-                ]
-            )
+    def test_main_no_auth_skips_warning(self, run_mock, _docker_mock):
+        logger = logging.getLogger("ai_sandbox")
+        with mock.patch.object(logger, "warning") as warn_mock:
+            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        ".",
+                        "--no-auth",
+                    ]
+                )
         self.assertIsNone(run_mock.call_args.args[5])
-        stderr_mock.write.assert_not_called()
+        warn_mock.assert_not_called()
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
-    def test_main_auth_file_none_skips_warning(self, run_mock):
-        with mock.patch(
-            "ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock
-        ) as stderr_mock:
-            cli.main(
-                [
-                    "--no-build",
-                    "--context",
-                    ".",
-                    "--auth-file",
-                    "none",
-                ]
-            )
+    def test_main_auth_file_none_skips_warning(self, run_mock, _docker_mock):
+        logger = logging.getLogger("ai_sandbox")
+        with mock.patch.object(logger, "warning") as warn_mock:
+            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        ".",
+                        "--auth-file",
+                        "none",
+                    ]
+                )
         self.assertIsNone(run_mock.call_args.args[5])
-        stderr_mock.write.assert_not_called()
+        warn_mock.assert_not_called()
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.os.path.isfile", return_value=False)
-    @mock.patch("ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock)
     @mock.patch("ai_sandbox.cli.run_container")
     def test_main_missing_auth_file_warns_with_resolved_candidates(
         self,
         run_mock,
-        stderr_mock,
         _isfile_mock,
+        _docker_mock,
     ):
-        cli.main(
-            [
-                "--no-build",
-                "--context",
-                "/ctx",
-                "--auth-file",
-                "~/.codex/device_auth.json",
-            ]
-        )
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING") as captured:
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        "/ctx",
+                        "--auth-file",
+                        "~/.codex/device_auth.json",
+                    ]
+                )
         self.assertIsNone(run_mock.call_args.args[5])
-        stderr_mock.write.assert_any_call(
-            "Warning: auth file not found at "
+        self.assertIn(
+            f"WARNING:ai_sandbox:Auth file not found at "
             f"{os.path.expanduser('~/.codex/device_auth.json')}. "
-            "Continuing without mounting credentials."
+            "Continuing without mounting credentials.",
+            captured.output,
         )
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.os.path.isfile", return_value=False)
     @mock.patch("ai_sandbox.cli.run_container")
-    def test_main_auth_file_relative_uses_context(self, run_mock, _isfile_mock):
-        with mock.patch(
-            "ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock
-        ) as stderr_mock:
-            cli.main(
-                [
-                    "--no-build",
-                    "--context",
-                    "/ctx",
-                    "--auth-file",
-                    "rel/device_auth.json",
-                ]
-            )
+    def test_main_auth_file_relative_uses_context(
+        self, run_mock, _isfile_mock, _docker_mock
+    ):
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING") as captured:
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        "/ctx",
+                        "--auth-file",
+                        "rel/device_auth.json",
+                    ]
+                )
         self.assertIsNone(run_mock.call_args.args[5])
-        stderr_mock.write.assert_any_call(
-            "Warning: auth file not found at "
+        self.assertIn(
+            "WARNING:ai_sandbox:Auth file not found at "
             "/ctx/rel/device_auth.json. "
-            "Continuing without mounting credentials."
+            "Continuing without mounting credentials.",
+            captured.output,
         )
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.os.path.isfile")
     @mock.patch("ai_sandbox.cli.run_container")
     @mock.patch("ai_sandbox.cli.build_image")
@@ -253,43 +285,185 @@ class TestRunContainer(unittest.TestCase):
         build_mock,
         run_mock,
         isfile_mock,
+        _docker_mock,
     ):
         def isfile_side_effect(path):
             return path.endswith("/.codex/auth.json")
 
         isfile_mock.side_effect = isfile_side_effect
 
-        cli.main(
-            [
-                "--no-build",
-                "--context",
-                "/ctx",
-            ]
-        )
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                [
+                    "--no-build",
+                    "--context",
+                    "/ctx",
+                ]
+            )
 
         self.assertEqual(
             run_mock.call_args.args[5],
             os.path.expanduser("~/.codex/auth.json"),
         )
 
+    @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.os.path.isfile", return_value=True)
     @mock.patch("ai_sandbox.cli.run_container")
-    def test_main_no_auth_overrides_auth_file(self, run_mock, _isfile_mock):
-        with mock.patch(
-            "ai_sandbox.cli.sys.stderr", new_callable=mock.MagicMock
-        ) as stderr_mock:
+    def test_main_no_auth_overrides_auth_file(
+        self, run_mock, _isfile_mock, _docker_mock
+    ):
+        logger = logging.getLogger("ai_sandbox")
+        with mock.patch.object(logger, "warning") as warn_mock:
+            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+                cli.main(
+                    [
+                        "--no-build",
+                        "--context",
+                        ".",
+                        "--auth-file",
+                        "~/.codex/device_auth.json",
+                        "--no-auth",
+                    ]
+                )
+        self.assertIsNone(run_mock.call_args.args[5])
+        warn_mock.assert_not_called()
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.run_container")
+    def test_main_sets_github_token_from_env(self, run_mock, _docker_mock):
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
             cli.main(
                 [
                     "--no-build",
                     "--context",
                     ".",
-                    "--auth-file",
-                    "~/.codex/device_auth.json",
                     "--no-auth",
                 ]
             )
-        self.assertIsNone(run_mock.call_args.args[5])
-        stderr_mock.write.assert_not_called()
+        extra_args = run_mock.call_args.args[3]
+        self.assertIn("-e", extra_args)
+        self.assertIn("GITHUB_TOKEN=token", extra_args)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.run_container")
+    def test_main_does_not_override_github_token(self, run_mock, _docker_mock):
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                [
+                    "--no-build",
+                    "--context",
+                    ".",
+                    "--no-auth",
+                    "--docker-arg",
+                    "GITHUB_TOKEN=override",
+                ]
+            )
+        extra_args = run_mock.call_args.args[3]
+        self.assertNotIn("GITHUB_TOKEN=token", extra_args)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.run_container")
+    def test_main_agent_copilot_sets_tokens(self, run_mock, _docker_mock):
+        with mock.patch.dict(
+            os.environ,
+            {"GH_TOKEN": "gh-token", "GITHUB_TOKEN": "github-token"},
+            clear=True,
+        ):
+            cli.main(
+                [
+                    "--no-build",
+                    "--context",
+                    ".",
+                    "--no-auth",
+                    "--agent",
+                    "copilot",
+                ]
+            )
+        extra_args = run_mock.call_args.args[3]
+        self.assertIn("-e", extra_args)
+        self.assertIn("GH_TOKEN=gh-token", extra_args)
+        self.assertIn("GITHUB_TOKEN=github-token", extra_args)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.run_container")
+    def test_main_agent_copilot_does_not_override_tokens(self, run_mock, _docker_mock):
+        with mock.patch.dict(
+            os.environ,
+            {"GH_TOKEN": "gh-token", "GITHUB_TOKEN": "github-token"},
+            clear=True,
+        ):
+            cli.main(
+                [
+                    "--no-build",
+                    "--context",
+                    ".",
+                    "--no-auth",
+                    "--agent",
+                    "copilot",
+                    "--docker-arg",
+                    "GH_TOKEN=override-gh",
+                    "--docker-arg",
+                    "GITHUB_TOKEN=override-github",
+                ]
+            )
+        extra_args = run_mock.call_args.args[3]
+        self.assertNotIn("GH_TOKEN=gh-token", extra_args)
+        self.assertNotIn("GITHUB_TOKEN=github-token", extra_args)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.run_container")
+    def test_main_agent_copilot_ignores_ai_pat_token(self, run_mock, _docker_mock):
+        with mock.patch.dict(
+            os.environ,
+            {"GITHUB_AI_PAT_TOKEN": "token"},
+            clear=True,
+        ):
+            cli.main(
+                [
+                    "--no-build",
+                    "--context",
+                    ".",
+                    "--no-auth",
+                    "--agent",
+                    "copilot",
+                ]
+            )
+        extra_args = run_mock.call_args.args[3]
+        self.assertNotIn("GITHUB_TOKEN=token", extra_args)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.subprocess.run")
+    def test_main_agent_copilot(self, run_mock, _docker_mock):
+        run_mock.return_value.returncode = 0
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                [
+                    "--no-build",
+                    "--no-tty",
+                    "--agent",
+                    "copilot",
+                ]
+            )
+        cmd = run_mock.call_args[0][0]
+        self.assertIn("copilot", cmd)
+        self.assertIn("--add-dir", cmd)
+        self.assertIn("/workspace", cmd)
+        self.assertIn("--allow-all-tools", cmd)
+
+    @mock.patch("ai_sandbox.cli._check_docker_available")
+    @mock.patch("ai_sandbox.cli.subprocess.run")
+    def test_main_agent_codex_default(self, run_mock, _docker_mock):
+        run_mock.return_value.returncode = 0
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            cli.main(
+                [
+                    "--no-build",
+                    "--no-tty",
+                ]
+            )
+        cmd = run_mock.call_args[0][0]
+        self.assertIn("codex", cmd)
+        self.assertIn("--full-auto", cmd)
 
 
 if __name__ == "__main__":
