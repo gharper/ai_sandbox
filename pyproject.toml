@@ -12,6 +12,10 @@ license = {text = "MIT"}
 authors = [{name = "gharper", email = "geromyh@gmail.com"}]
 urls = {Repository = "https://github.com/gharper/ai_sandbox", Issues = "https://github.com/gharper/ai_sandbox/issues"}
 
+[project.optional-dependencies]
+dev = ["ruff"]
+build = ["build"]
+
 [project.scripts]
 ai_sandbox = "ai_sandbox.cli:main"
 

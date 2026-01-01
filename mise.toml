@@ -14,7 +14,17 @@ ruff = "latest"
 [tasks.install]
 description = "Install dependencies"
 alias = "i"
-run = "uv pip install -r requirements.txt"
+run = [
+  "python -m pip install --upgrade pip",
+  "python -m pip install -e '.[build]'"
+]
+
+[tasks.build]
+description = "Build package"
+run = [
+  "python -m pip install -e '.[build]'",
+  "python -m build"
+]
 
 [tasks.run]
 description = "Run the application"
