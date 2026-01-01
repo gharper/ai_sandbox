@@ -4,18 +4,13 @@ Dockerized environment for running agents with full permissions.
 
 ## Quick start
 
-Build and run the container with the current repo mounted at `/workspace`. The default command is `codex --full-auto`:
-
-```bash
-python -m ai_sandbox
-```
-
-Choose an agent:
+Build and run the container with the current repo mounted inside the container at `/workspace`.
 
 ```bash
 ai_sandbox --agent codex
 ai_sandbox --agent copilot
 ```
+If an agent is not specified, the default is `copilot`.
 
 Install as a CLI tool inside a virtual environment:
 
@@ -78,6 +73,16 @@ Run tests:
 
 ```bash
 python -m unittest discover -s tests
+```
+
+Manual build:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e ".[build]"
+python -m build
 ```
 
 ## Copilot
