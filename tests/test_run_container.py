@@ -7,6 +7,13 @@ from ai_sandbox import cli
 
 
 class TestRunContainer(unittest.TestCase):
+    def setUp(self):
+        self._orig_cli = cli._CONTAINER_CLI
+        cli._CONTAINER_CLI = "docker"
+
+    def tearDown(self):
+        cli._CONTAINER_CLI = self._orig_cli
+
     @mock.patch("ai_sandbox.cli.run_subprocess")
     def test_build_image_defaults(self, run_mock):
         cli.build_image("img", "Dockerfile", "/ctx")
@@ -152,17 +159,19 @@ class TestRunContainer(unittest.TestCase):
     @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
     @mock.patch("ai_sandbox.cli.build_image")
+    @mock.patch("ai_sandbox.cli.image_exists", return_value=False)
     def test_main_resolves_context_and_dockerfile(
-        self, build_mock, run_mock, _docker_mock
+        self, _image_exists_mock, build_mock, run_mock, _docker_mock
     ):
         rel_context = os.path.relpath("some/context", os.getcwd())
         expected_context = os.path.abspath(os.path.expanduser(rel_context))
         expected_dockerfile = os.path.join(expected_context, "Dockerfile")
 
         with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
-            cli.main(
-                ["--context", rel_context, "--auth-file", "~/.codex/device_auth.json"]
-            )
+            with mock.patch("ai_sandbox.cli.os.path.isfile", return_value=True):
+                cli.main(
+                    ["--context", rel_context, "--auth-file", "~/.codex/device_auth.json"]
+                )
 
         build_mock.assert_called_once_with(
             "ai-sandbox-codex",
@@ -191,9 +200,9 @@ class TestRunContainer(unittest.TestCase):
     @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
     def test_main_no_auth_skips_warning(self, run_mock, _docker_mock):
-        logger = logging.getLogger("ai_sandbox")
-        with mock.patch.object(logger, "warning") as warn_mock:
-            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+        # Test that NO AUTH warnings appear when --no-auth is used
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING") as captured:
                 cli.main(
                     [
                         "--no-build",
@@ -203,14 +212,16 @@ class TestRunContainer(unittest.TestCase):
                     ]
                 )
         self.assertIsNone(run_mock.call_args.args[5])
-        warn_mock.assert_not_called()
+        # Should only have the --context deprecation warning, NOT auth warnings
+        auth_warnings = [log for log in captured.output if "Auth file not found" in log]
+        self.assertEqual(len(auth_warnings), 0)
 
     @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
     def test_main_auth_file_none_skips_warning(self, run_mock, _docker_mock):
-        logger = logging.getLogger("ai_sandbox")
-        with mock.patch.object(logger, "warning") as warn_mock:
-            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+        # Test that NO AUTH warnings appear when --auth-file none is used
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING") as captured:
                 cli.main(
                     [
                         "--no-build",
@@ -221,7 +232,9 @@ class TestRunContainer(unittest.TestCase):
                     ]
                 )
         self.assertIsNone(run_mock.call_args.args[5])
-        warn_mock.assert_not_called()
+        # Should only have the --context deprecation warning, NOT auth warnings
+        auth_warnings = [log for log in captured.output if "Auth file not found" in log]
+        self.assertEqual(len(auth_warnings), 0)
 
     @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.os.path.isfile", return_value=False)
@@ -312,9 +325,9 @@ class TestRunContainer(unittest.TestCase):
     def test_main_no_auth_overrides_auth_file(
         self, run_mock, _isfile_mock, _docker_mock
     ):
-        logger = logging.getLogger("ai_sandbox")
-        with mock.patch.object(logger, "warning") as warn_mock:
-            with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+        # Test that --no-auth overrides --auth-file and no auth warnings appear
+        with mock.patch.dict(os.environ, {"GITHUB_AI_PAT_TOKEN": "token"}):
+            with self.assertLogs("ai_sandbox", level="WARNING") as captured:
                 cli.main(
                     [
                         "--no-build",
@@ -326,7 +339,9 @@ class TestRunContainer(unittest.TestCase):
                     ]
                 )
         self.assertIsNone(run_mock.call_args.args[5])
-        warn_mock.assert_not_called()
+        # Should only have the --context deprecation warning, NOT auth warnings
+        auth_warnings = [log for log in captured.output if "Auth file not found" in log]
+        self.assertEqual(len(auth_warnings), 0)
 
     @mock.patch("ai_sandbox.cli._check_docker_available")
     @mock.patch("ai_sandbox.cli.run_container")
@@ -464,6 +479,32 @@ class TestRunContainer(unittest.TestCase):
         cmd = run_mock.call_args[0][0]
         self.assertIn("codex", cmd)
         self.assertIn("--full-auto", cmd)
+
+    @mock.patch("ai_sandbox.cli.run_subprocess")
+    @mock.patch("ai_sandbox.cli.shutil.which")
+    def test_check_docker_falls_back_to_podman(self, which_mock, run_mock):
+        cli._CONTAINER_CLI = None
+
+        def which_side_effect(cmd):
+            if cmd == "docker":
+                return None
+            if cmd == "podman":
+                return "/usr/bin/podman"
+            return None
+
+        which_mock.side_effect = which_side_effect
+        run_mock.return_value.returncode = 0
+
+        self.assertEqual(cli._check_docker_available(), "podman")
+        self.assertEqual(cli._CONTAINER_CLI, "podman")
+        run_mock.assert_called_once_with(["podman", "info"], timeout=10)
+
+    @mock.patch("ai_sandbox.cli.shutil.which", return_value=None)
+    def test_check_docker_raises_when_no_engines(self, which_mock):
+        cli._CONTAINER_CLI = None
+        with self.assertRaises(FileNotFoundError):
+            cli._check_docker_available()
+        self.assertEqual(which_mock.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -17,6 +18,7 @@ DEFAULT_AUTH_FILES = (
 )
 
 REDACT_KEYS = {"GITHUB_TOKEN", "GH_TOKEN", "GITHUB_AI_PAT_TOKEN", "PASSWORD", "SECRET"}
+_CONTAINER_CLI: str | None = None
 
 
 def _configure_logging() -> None:
@@ -96,9 +98,32 @@ def run_subprocess(
         raise
 
 
+def _get_container_cli() -> str:
+    if _CONTAINER_CLI is None:
+        return _check_docker_available()
+    return _CONTAINER_CLI
+
+
+def image_exists(image: str) -> bool:
+    """Check if a Docker image exists locally."""
+    logger = logging.getLogger("ai_sandbox")
+    container_cli = _get_container_cli()
+    try:
+        result = run_subprocess(
+            [container_cli, "image", "inspect", image],
+            check=False,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        logger.debug("Failed to check if image %s exists", image)
+        return False
+
+
 def build_image(image: str, dockerfile: str, context: str) -> None:
     logger = logging.getLogger("ai_sandbox")
-    cmd = ["docker", "build", "-t", image, "-f", dockerfile, context]
+    container_cli = _get_container_cli()
+    cmd = [container_cli, "build", "-t", image, "-f", dockerfile, context]
     logger.info("Building Docker image %s using %s", image, dockerfile)
     run_subprocess(cmd, timeout=900)
 
@@ -112,8 +137,9 @@ def build_run_command(
     auth_file: str | None,
     use_tty: bool,
 ) -> List[str]:
+    container_cli = _get_container_cli()
     cmd = [
-        "docker",
+        container_cli,
         "run",
         "--rm",
         "--add-host",
@@ -191,6 +217,23 @@ def run_container(
         raise
 
 
+def get_package_root() -> str | None:
+    """Find the ai_sandbox package installation directory containing Dockerfile."""
+    import ai_sandbox
+    
+    # Try to find the package directory
+    package_dir = os.path.dirname(os.path.abspath(ai_sandbox.__file__))
+    # Go up one level to the project root
+    project_root = os.path.dirname(package_dir)
+    
+    # Check if Dockerfile exists in the project root
+    dockerfile_path = os.path.join(project_root, "Dockerfile")
+    if os.path.isfile(dockerfile_path):
+        return project_root
+    
+    return None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build and run the Codex Docker image with the repo mounted."
@@ -199,18 +242,28 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--name", default=None, help="Optional container name")
     parser.add_argument(
         "--dockerfile",
-        default="Dockerfile",
-        help="Path to the Dockerfile",
+        default=None,
+        help="Path to the Dockerfile (default: auto-detect from package installation)",
     )
     parser.add_argument(
-        "--context",
+        "--build-context",
+        default=None,
+        help="Build context directory (default: auto-detect from package installation)",
+    )
+    parser.add_argument(
+        "--mount-dir",
         default=os.getcwd(),
-        help="Build context and host directory to mount",
+        help="Host directory to mount into /workspace (default: current directory)",
     )
     parser.add_argument(
         "--no-build",
         action="store_true",
         help="Skip docker build",
+    )
+    parser.add_argument(
+        "--force-build",
+        action="store_true",
+        help="Force docker build even if image exists",
     )
     parser.add_argument(
         "--docker-arg",
@@ -247,6 +300,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs=argparse.REMAINDER,
         help="Command to run in the container (default: /bin/bash)",
     )
+    # Legacy support
+    parser.add_argument(
+        "--context",
+        dest="_legacy_context",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     return parser.parse_args(argv)
 
 
@@ -272,15 +332,40 @@ def resolve_auth_file(
     return None
 
 
-def _check_docker_available() -> None:
+def _check_docker_available() -> str:
+    global _CONTAINER_CLI
+    if _CONTAINER_CLI is not None:
+        return _CONTAINER_CLI
+
     logger = logging.getLogger("ai_sandbox")
+    container_cli: str | None = None
+
+    if shutil.which("docker"):
+        container_cli = "docker"
+    elif shutil.which("podman"):
+        container_cli = "podman"
+
+    if not container_cli:
+        logger.error(
+            "Neither docker nor podman commands were found on PATH. "
+            "Install Docker Desktop or Podman before running ai-sandbox."
+        )
+        raise FileNotFoundError("docker or podman command not found on PATH")
+
     try:
-        run_subprocess(["docker", "info"], timeout=10)
+        run_subprocess([container_cli, "info"], timeout=10)
     except Exception:
         logger.exception(
-            "Docker does not appear to be available. Ensure the Docker daemon is running and you have access to it."
+            "%s does not appear to be available. Ensure the service is running and you have access to it.",
+            container_cli.capitalize(),
         )
         raise
+
+    if container_cli == "podman":
+        logger.info("Using podman as container engine because docker was not found.")
+
+    _CONTAINER_CLI = container_cli
+    return container_cli
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -288,6 +373,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     logger = logging.getLogger("ai_sandbox")
     try:
         args = parse_args(argv)
+        
+        # Handle legacy --context argument (only warn if actually used)
+        if hasattr(args, '_legacy_context') and args._legacy_context is not None:
+            logger.warning(
+                "--context is deprecated. Use --build-context for build directory "
+                "and --mount-dir for directory to mount into container."
+            )
+            if args.build_context is None:
+                args.build_context = args._legacy_context
+            if args.mount_dir == os.getcwd():
+                args.mount_dir = args._legacy_context
+        
         cmd_args = list(args.cmd)
         if cmd_args[:1] == ["--"]:
             cmd_args = cmd_args[1:]
@@ -298,7 +395,47 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             container_cmd = ["codex", "--full-auto"]
         use_tty = not args.no_tty
-        context = os.path.abspath(os.path.expanduser(args.context))
+        
+        # Resolve mount directory (where user is running from)
+        mount_dir = os.path.abspath(os.path.expanduser(args.mount_dir))
+        
+        # Resolve build context and dockerfile
+        if args.build_context is not None:
+            # User specified build context explicitly
+            build_context = os.path.abspath(os.path.expanduser(args.build_context))
+            if args.dockerfile is not None:
+                if os.path.isabs(args.dockerfile):
+                    dockerfile = args.dockerfile
+                else:
+                    dockerfile = os.path.join(build_context, args.dockerfile)
+            else:
+                dockerfile = os.path.join(build_context, "Dockerfile")
+        else:
+            # Auto-detect from package installation
+            package_root = get_package_root()
+            if package_root:
+                build_context = package_root
+                if args.dockerfile is not None:
+                    if os.path.isabs(args.dockerfile):
+                        dockerfile = args.dockerfile
+                    else:
+                        dockerfile = os.path.join(build_context, args.dockerfile)
+                else:
+                    dockerfile = os.path.join(build_context, "Dockerfile")
+            else:
+                # Fallback to current directory (for development)
+                logger.warning(
+                    "Could not auto-detect package root. Using current directory as build context."
+                )
+                build_context = mount_dir
+                if args.dockerfile is not None:
+                    if os.path.isabs(args.dockerfile):
+                        dockerfile = args.dockerfile
+                    else:
+                        dockerfile = os.path.join(build_context, args.dockerfile)
+                else:
+                    dockerfile = os.path.join(build_context, "Dockerfile")
+        
         extra_args = list(args.docker_arg)
         if args.agent == "copilot":
             gh_token = os.getenv("GH_TOKEN")
@@ -320,26 +457,43 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.no_auth or (args.auth_file and args.auth_file.lower() == "none"):
             auth_file = None
         else:
-            resolved_auth_candidates = resolve_auth_candidates(context, auth_candidates)
-            auth_file = resolve_auth_file(context, auth_candidates)
+            resolved_auth_candidates = resolve_auth_candidates(mount_dir, auth_candidates)
+            auth_file = resolve_auth_file(mount_dir, auth_candidates)
             if not auth_file:
                 logger.warning(
                     "Auth file not found at %s. Continuing without mounting credentials.",
                     ", ".join(resolved_auth_candidates),
                 )
-        if os.path.isabs(args.dockerfile):
-            dockerfile = args.dockerfile
-        else:
-            dockerfile = os.path.join(context, args.dockerfile)
 
         # validate Docker early and give a helpful error
         _check_docker_available()
 
-        if not args.no_build:
-            build_image(args.image, dockerfile, context)
+        # Determine if we need to build
+        needs_build = False
+        if args.force_build:
+            needs_build = True
+            logger.info("Force build requested")
+        elif args.no_build:
+            needs_build = False
+        elif not image_exists(args.image):
+            needs_build = True
+            logger.info("Image %s not found locally, will build", args.image)
+        else:
+            logger.info("Image %s exists, skipping build", args.image)
+        
+        if needs_build:
+            if not os.path.isfile(dockerfile):
+                logger.error(
+                    "Dockerfile not found at %s. Cannot build image. "
+                    "Use --dockerfile or --build-context to specify the correct location.",
+                    dockerfile,
+                )
+                return 1
+            build_image(args.image, dockerfile, build_context)
+        
         run_container(
             args.image,
-            context,
+            mount_dir,
             args.name,
             extra_args,
             container_cmd,
