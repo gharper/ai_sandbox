@@ -27,6 +27,7 @@ To run with a specific agent, use:
 ai_sandbox --agent codex
 ai_sandbox --agent copilot
 ```
+If an agent is not specified, the default is `copilot`.
 
 The command will automatically:
 - Use an existing `ai-sandbox-codex` image if available (no rebuild needed)
